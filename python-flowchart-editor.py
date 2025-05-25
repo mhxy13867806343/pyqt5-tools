@@ -12,9 +12,12 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraphic
                              QToolBar, QComboBox, QPushButton, QVBoxLayout, QHBoxLayout,
                              QWidget, QLabel, QLineEdit, QDialog, QFormLayout, QDialogButtonBox,
                              QFileDialog, QGraphicsPathItem, QStackedWidget, QSlider)
-from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF, QSizeF, QSize
+from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF, QSizeF, QSize, QMarginsF
 from PyQt5.QtGui import QPen, QBrush, QColor, QPainterPath, QPolygonF, QFont, QIcon, QPainter, QPixmap, QFontMetrics, \
-    QLinearGradient
+    QLinearGradient, QImage, QPdfWriter, QPageSize, QKeySequence
+
+# 导入自定义模块
+from flowchart import export, extensions, advanced, save_functions
 
 # 节点类型
 NODE_TYPES = {
@@ -24,6 +27,9 @@ NODE_TYPES = {
     "叶子节点": {"shape": "rounded_rect", "color": QColor(211, 211, 211)},  # 浅灰色
     "备注": {"shape": "cloud", "color": QColor(255, 255, 153)},  # 浅黄色
 }
+
+# 添加扩展节点类型
+NODE_TYPES.update(extensions.EXTENDED_NODE_TYPES)
 
 class FlowchartNode(QGraphicsItem):
     """思维导图节点"""
@@ -161,35 +167,83 @@ class FlowchartNode(QGraphicsItem):
         """右键菜单"""
         menu = QMenu()
         edit_action = menu.addAction("编辑")
+        edit_action.triggered.connect(self.editNode)
+        
         add_child_action = menu.addAction("添加子节点")
+        add_child_action.triggered.connect(self.addChildNode)
+        
         delete_action = menu.addAction("删除")
+        delete_action.triggered.connect(self.deleteNode)
+        
         color_action = menu.addAction("更改颜色")
+        color_action.triggered.connect(self.changeColor)
         
-        action = menu.exec_(event.screenPos())
+        # 添加折叠/展开子菜单
+        if self.get_child_nodes():
+            menu.addSeparator()
+            fold_menu = menu.addMenu("折叠/展开")
+            
+            # 检查当前节点状态
+            is_folded = getattr(self, 'is_folded', False)
+            all_children = self.getAllChildNodes()
+            direct_children = self.get_child_nodes()
+            
+            if is_folded:
+                # 如果已经折叠，显示展开选项
+                expand_action = fold_menu.addAction("展开当前层级")
+                expand_action.triggered.connect(lambda: self.toggleFold())
+                
+                if len(all_children) > len(direct_children):
+                    expand_all_action = fold_menu.addAction("展开所有层级")
+                    expand_all_action.triggered.connect(lambda: self.expandAllLevels())
+            else:
+                # 如果未折叠，显示折叠选项
+                fold_action = fold_menu.addAction("折叠当前层级")
+                fold_action.triggered.connect(lambda: self.toggleFold())
+                
+                if len(all_children) > len(direct_children):
+                    fold_all_action = fold_menu.addAction("折叠所有层级")
+                    fold_all_action.triggered.connect(lambda: self.foldAllLevels())
         
-        if action == edit_action:
-            self.editNode()
-        elif action == add_child_action:
-            self.addChildNode()
-        elif action == delete_action:
-            self.deleteNode()
-        elif action == color_action:
-            self.changeColor()
+        menu.addSeparator()
+        
+        # 添加图片相关菜单
+        add_image_action = menu.addAction("添加图片")
+        add_image_action.triggered.connect(lambda: self.addImage())
+        
+        remove_image_action = menu.addAction("移除图片")
+        remove_image_action.triggered.connect(lambda: self.removeImage())
+        
+        # 如果节点没有图片，禁用移除图片选项
+        if not hasattr(self, 'image') or self.image is None:
+            remove_image_action.setEnabled(False)
+        
+        menu.addSeparator()
+        
+        # 添加链接相关菜单
+        add_link_action = menu.addAction("添加链接")
+        add_link_action.triggered.connect(lambda: self.addLink())
+        
+        remove_link_action = menu.addAction("移除链接")
+        remove_link_action.triggered.connect(lambda: self.removeLink())
+        
+        # 如果节点没有链接，禁用移除链接选项
+        if not hasattr(self, 'link') or not self.link:
+            remove_link_action.setEnabled(False)
+        
+        # 执行菜单
+        menu.exec_(event.screenPos())
     
     def addChildNode(self):
         """添加子节点"""
-        # 获取主窗口
-        main_window = None
-        parent = self.scene().views()[0].parent()
-        while parent is not None:
-            if isinstance(parent, FlowchartEditor):
-                main_window = parent
-                break
-            parent = parent.parent()
+        # 直接使用views中存储的main_window引用
+        main_window = self.scene().views()[0].main_window
         
         if main_window:
             # 调用主窗口的addNode方法，并传入当前节点作为父节点
             main_window.addNode(self)
+        else:
+            QMessageBox.warning(None, "错误", "无法找到主窗口实例")
     
     def editNode(self):
         """编辑节点文本"""
@@ -255,12 +309,118 @@ class FlowchartNode(QGraphicsItem):
         
         return child_nodes
     
+    def mouseDoubleClickEvent(self, event):
+        """双击编辑节点或折叠/展开"""
+        # 如果按住Ctrl键，则折叠/展开节点，否则编辑节点
+        if event.modifiers() & Qt.ControlModifier:
+            # 使用扩展模块的折叠/展开功能
+            advanced.extend_node_mouse_double_click_event(self, event, self.scene().views()[0].main_window)
+        else:
+            self.editNode()
+    
     def changeColor(self):
         """更改节点颜色"""
         color = QColorDialog.getColor(self.color, None, "选择节点颜色")
         if color.isValid():
             self.color = color
             self.update()
+            self.scene().views()[0].main_window.setModified(True)
+    
+    def get_child_nodes(self):
+        """获取直接子节点"""
+        child_nodes = []
+        scene = self.scene()
+        
+        if not scene:
+            return child_nodes
+        
+        for item in scene.items():
+            if isinstance(item, FlowchartConnection) and item.start_node == self:
+                child_node = item.end_node
+                child_nodes.append(child_node)
+        
+        return child_nodes
+    
+    def toggleFold(self):
+        """切换节点的折叠/展开状态"""
+        main_window = self.scene().views()[0].main_window
+        if hasattr(main_window, 'shortcut_manager'):
+            # 通过快捷键管理器来切换折叠状态
+            main_window.shortcut_manager._toggle_fold_node(self)
+    
+    def foldAllLevels(self):
+        """折叠所有层级的子节点"""
+        main_window = self.scene().views()[0].main_window
+        if hasattr(main_window, 'shortcut_manager'):
+            # 使用快捷键管理器的多层折叠方法
+            main_window.shortcut_manager._fold_all_levels(self)
+    
+    def expandAllLevels(self):
+        """展开所有层级的子节点"""
+        # 获取所有子节点（包括子节点的子节点）
+        all_descendants = self.getAllChildNodes()
+        
+        # 将所有子节点设置为可见，并取消折叠状态
+        for child in all_descendants:
+            child.setVisible(True)
+            if hasattr(child, 'is_folded'):
+                child.is_folded = False
+        
+        # 还需要将当前节点的折叠状态取消
+        self.is_folded = False
+        
+        # 更新场景
+        self.scene().update()
+        
+        # 标记为已修改
+        self.scene().views()[0].main_window.setModified(True)
+    
+    def addImage(self):
+        """添加图片到节点"""
+        main_window = self.scene().views()[0].main_window
+        file_path, _ = QFileDialog.getOpenFileName(
+            main_window, 
+            "选择图片", 
+            "", 
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif)"
+        )
+        
+        if file_path:
+            try:
+                self.image = QPixmap(file_path)
+                self.update()
+                main_window.setModified(True)
+            except Exception as e:
+                QMessageBox.critical(main_window, "错误", f"无法加载图片: {str(e)}")
+    
+    def removeImage(self):
+        """从节点移除图片"""
+        if hasattr(self, 'image') and self.image is not None:
+            self.image = None
+            self.update()
+            self.scene().views()[0].main_window.setModified(True)
+    
+    def addLink(self):
+        """添加链接到节点"""
+        main_window = self.scene().views()[0].main_window
+        link, ok = QInputDialog.getText(
+            main_window, 
+            "添加链接", 
+            "请输入URL链接:",
+            text=getattr(self, 'link', '')
+        )
+        
+        if ok and link:
+            self.link = link
+            self.update()
+            main_window.setModified(True)
+    
+    def removeLink(self):
+        """从节点移除链接"""
+        if hasattr(self, 'link') and self.link:
+            self.link = None
+            self.update()
+            self.scene().views()[0].main_window.setModified(True)
 
 class FlowchartConnection(QGraphicsPathItem):
     """思维导图连接线"""
@@ -411,11 +571,15 @@ class FlowchartConnection(QGraphicsPathItem):
     def deleteConnection(self):
         """删除连接线"""
         # 从节点的连接列表中移除此连接
-        self.start_node.connections.remove(self)
-        self.end_node.connections.remove(self)
+        if hasattr(self, 'start_node') and self in self.start_node.connections:
+            self.start_node.connections.remove(self)
+        if hasattr(self, 'end_node') and self in self.end_node.connections:
+            self.end_node.connections.remove(self)
         
         # 从场景中移除
-        self.scene().removeItem(self)
+        scene = self.scene()
+        if scene is not None:
+            scene.removeItem(self)
 
 class NodePropertiesDialog(QDialog):
     """节点属性对话框"""
@@ -519,30 +683,49 @@ class FlowchartView(QGraphicsView):
         # 检查点击位置是否有节点
         item = self.itemAt(event.pos())
         
-        # 如果点击在空白处，显示创建节点的右键菜单
+        # 如果点击在空白处
         if not item:
-            menu = QMenu()
-            create_action = menu.addAction("创建节点")
+            # 检查场景中是否有中心主题
+            has_center_node = False
+            has_nodes = False
             
-            # 如果场景中没有节点，添加创建中心主题的选项
-            if not self.scene().items(Qt.AscendingOrder):
+            for scene_item in self.scene().items():
+                if isinstance(scene_item, FlowchartNode):
+                    has_nodes = True
+                    if scene_item.node_type == "中心主题":
+                        has_center_node = True
+                        break
+            
+            # 如果没有任何节点，则显示创建中心主题的选项
+            if not has_nodes:
+                menu = QMenu()
                 create_center_action = menu.addAction("创建中心主题")
-            else:
-                create_center_action = None
-            
-            action = menu.exec_(event.globalPos())
-            
-            if action == create_action and self.main_window:
-                # 获取鼠标点击的场景坐标
-                scene_pos = self.mapToScene(event.pos())
-                self.main_window.addNodeAt(scene_pos)
-            elif action == create_center_action and self.main_window:
-                # 获取鼠标点击的场景坐标
-                scene_pos = self.mapToScene(event.pos())
-                self.main_window.addCenterNodeAt(scene_pos)
-            
-            event.accept()
-            return
+                
+                action = menu.exec_(event.globalPos())
+                
+                if action == create_center_action and self.main_window:
+                    # 获取鼠标点击的场景坐标
+                    scene_pos = self.mapToScene(event.pos())
+                    self.main_window.addCenterNodeAt(scene_pos)
+                
+                event.accept()
+                return
+            # 如果没有中心主题，则显示创建中心主题的选项
+            elif not has_center_node:
+                menu = QMenu()
+                create_center_action = menu.addAction("创建中心主题")
+                
+                action = menu.exec_(event.globalPos())
+                
+                if action == create_center_action and self.main_window:
+                    # 获取鼠标点击的场景坐标
+                    scene_pos = self.mapToScene(event.pos())
+                    self.main_window.addCenterNodeAt(scene_pos)
+                
+                event.accept()
+                return
+            # 如果已经有中心主题，则不显示创建节点的选项
+            # 直接通过这里，不显示任何菜单
         
         # 如果点击在节点上，让节点处理右键菜单
         super().contextMenuEvent(event)
@@ -831,17 +1014,12 @@ class FlowchartEditor(QMainWindow):
         # 创建场景和视图
         self.scene = QGraphicsScene(self)
         self.scene.setSceneRect(-2500, -2500, 5000, 5000)
-        self.view = FlowchartView(self.scene)
+        self.view = FlowchartView(self.scene, self)
+        self.view.main_window = self  # 直接设置main_window引用
         self.central_stack.addWidget(self.view)
         
         # 默认显示欢迎界面
         self.central_stack.setCurrentIndex(0)
-        
-        # 创建工具栏
-        self.createToolBar()
-        
-        # 创建状态栏
-        self.statusBar().showMessage("准备就绪")
         
         # 当前文件路径
         self.current_file = None
@@ -856,6 +1034,21 @@ class FlowchartEditor(QMainWindow):
         
         # 设置关闭事件处理
         self.setAttribute(Qt.WA_DeleteOnClose, True)
+        
+        # 导出设置
+        self.export_margin = 20  # 导出时的边距
+        
+        # 初始化导出器
+        self.exporter = export.FlowchartExporter(self)
+        
+        # 初始化键盘快捷键管理器
+        self.shortcut_manager = advanced.KeyboardShortcutManager(self)
+        
+        # 创建工具栏
+        self.createToolBar()
+        
+        # 创建状态栏
+        self.statusBar().showMessage("准备就绪")
     
     def closeEvent(self, event):
         """关闭窗口事件处理"""
@@ -888,12 +1081,23 @@ class FlowchartEditor(QMainWindow):
             self.setWindowTitle(f"{title} *")
         elif not modified and title.endswith(' *'):
             self.setWindowTitle(title[:-2])
-    
+
+    def auto_layout(self):
+        """应用自动布局算法"""
+        auto_layout = advanced.AutoLayoutAlgorithm(self)
+        auto_layout.apply_layout()
+
+    def toggle_fold_selected(self):
+        """折叠/展开选中节点"""
+        if hasattr(self, 'shortcut_manager'):
+            self.shortcut_manager.toggle_fold_selected()
+
     def createToolBar(self):
         """创建工具栏"""
-        toolbar = QToolBar("工具栏", self)
+        toolbar = QToolBar(self)
+        toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        
+
         # 返回主页按钮
         home_button = QPushButton("返回主页")
         home_button.setToolTip("返回主页面")
@@ -941,14 +1145,34 @@ class FlowchartEditor(QMainWindow):
         
         save_button = QPushButton("保存")
         save_button.setToolTip("保存当前思维导图")
-        save_button.clicked.connect(self.saveFlowchart)
+        save_button.clicked.connect(lambda: save_functions.save_flowchart(self))
         toolbar.addWidget(save_button)
         
         # 另存为按钮
         save_as_button = QPushButton("另存为")
         save_as_button.setToolTip("将当前思维导图另存为新文件")
-        save_as_button.clicked.connect(self.saveFlowchartAs)
+        save_as_button.clicked.connect(lambda: save_functions.save_flowchart_as(self))
         toolbar.addWidget(save_as_button)
+        
+        toolbar.addSeparator()
+        
+        # 导出按钮
+        export_button = QPushButton("导出")
+        export_button.setToolTip("导出为图片或PDF")
+        export_button.clicked.connect(self.exporter.export_flowchart)
+        toolbar.addWidget(export_button)
+        
+        # 自动布局按钮
+        auto_layout_button = QPushButton("自动布局")
+        auto_layout_button.setToolTip("应用自动布局算法")
+        auto_layout_button.clicked.connect(self.auto_layout)
+        toolbar.addWidget(auto_layout_button)
+        
+        # 折叠/展开按钮
+        fold_button = QPushButton("折叠/展开")
+        fold_button.setToolTip("折叠或展开选中节点")
+        fold_button.clicked.connect(self.toggle_fold_selected)
+        toolbar.addWidget(fold_button)
         
         toolbar.addSeparator()
         
@@ -1720,75 +1944,84 @@ def openFlowchart(self):
     
     return False
 
-def saveFlowchart(self):
-    """保存思维导图"""
-    if not self.current_file:
-        return self.saveFlowchartAs()
-    
-    try:
-        # 收集节点和连接数据
-        data = {"nodes": [], "connections": []}
+    def saveFlowchart(self):
+        """保存思维导图"""
+        if not self.current_file:
+            return self.saveFlowchartAs()
         
-        # 节点ID映射
-        node_to_id = {}
-        node_id = 0
-        
-        # 收集节点数据
-        for item in self.scene.items():
-            if isinstance(item, FlowchartNode):
-                node_id += 1
-                node_to_id[item] = str(node_id)
-                
-                node_data = {
-                    "id": str(node_id),
-                    "type": item.node_type,
-                    "text": item.node_text,
-                    "x": item.scenePos().x(),
-                    "y": item.scenePos().y(),
-                    "color": item.color.name()
-                }
-                data["nodes"].append(node_data)
-        
-        # 收集连接数据
-        for item in self.scene.items():
-            if isinstance(item, FlowchartConnection):
-                if item.start_node in node_to_id and item.end_node in node_to_id:
-                    conn_data = {
-                        "start": node_to_id[item.start_node],
-                        "end": node_to_id[item.end_node],
-                        "color": item.color.name(),
-                        "width": item.pen().width()
+        try:
+            # 收集节点和连接数据
+            data = {"nodes": [], "connections": []}
+            
+            # 节点ID映射
+            node_to_id = {}
+            node_id = 0
+            
+            # 收集节点数据
+            for item in self.scene.items():
+                if isinstance(item, FlowchartNode):
+                    node_id += 1
+                    node_to_id[item] = str(node_id)
+                    
+                    node_data = {
+                        "id": str(node_id),
+                        "type": item.node_type,
+                        "text": item.node_text,
+                        "x": item.scenePos().x(),
+                        "y": item.scenePos().y(),
+                        "color": item.color.name()
                     }
-                    data["connections"].append(conn_data)
-        
-        # 保存到文件
-        with open(self.current_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        # 重置修改状态
-        self.setModified(False)
-        
-        self.statusBar().showMessage(f"已保存到 {self.current_file}")
-        return True
-    
-    except Exception as e:
-        QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
-        return False
+                    data["nodes"].append(node_data)
+            
+            # 收集连接数据
+            for item in self.scene.items():
+                if isinstance(item, FlowchartConnection):
+                    if item.start_node in node_to_id and item.end_node in node_to_id:
+                        conn_data = {
+                            "start": node_to_id[item.start_node],
+                            "end": node_to_id[item.end_node],
+                            "color": item.color.name(),
+                            "width": item.pen().width()
+                        }
+                        data["connections"].append(conn_data)
+            
+            # 保存为JSON文件
+            with open(self.current_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            # 重置修改状态
+            self.setModified(False)
+            
+            self.statusBar().showMessage(f"已保存到 {self.current_file}")
+            return True
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+            return False
 
-def saveFlowchartAs(self):
-    """思维导图另存为"""
-    file_path, _ = QFileDialog.getSaveFileName(
-        self, "思维导图另存为", "", "思维导图文件 (*.flow);;所有文件 (*)")
+    def saveFlowchartAs(self):
+        """思维导图另存为"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "思维导图另存为", "", "思维导图文件 (*.flow);;所有文件 (*)")
+        
+        if not file_path:
+            return False
+        
+        # 确保文件扩展名
+        if not file_path.endswith('.flow'):
+            file_path += '.flow'
+        
+        self.current_file = file_path
+        return self.saveFlowchart()  # 调用保存方法
+
+    def auto_layout(self):
+        """应用自动布局算法"""
+        auto_layout = advanced.AutoLayoutAlgorithm(self)
+        auto_layout.apply_layout()
     
-    if not file_path:
-        return False
-    
-    # 确保文件扩展名
-    if not file_path.endswith('.flow'):
-        file_path += '.flow'
-    
-    self.current_file = file_path
-    return self.saveFlowchart()  # 调用保存方法
+    def toggle_fold_selected(self):
+        """折叠/展开选中节点"""
+        self.shortcut_manager.toggle_fold_selected()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
