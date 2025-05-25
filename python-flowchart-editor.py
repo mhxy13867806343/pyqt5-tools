@@ -172,6 +172,39 @@ class FlowchartNode(QGraphicsItem):
         add_child_action = menu.addAction("添加子节点")
         add_child_action.triggered.connect(self.addChildNode)
         
+        # 添加连接到其他节点的选项
+        connect_menu = menu.addMenu("连接到节点")
+        
+        # 获取场景中的所有节点
+        scene = self.scene()
+        all_nodes = []
+        if scene:
+            for item in scene.items():
+                if isinstance(item, FlowchartNode) and item != self:
+                    all_nodes.append(item)
+        
+        # 如果有其他节点，则添加连接选项
+        if all_nodes:
+            # 对节点按照节点类型和文本排序
+            all_nodes.sort(key=lambda x: (x.node_type, x.node_text))
+            
+            # 将节点按类型分组
+            node_groups = {}
+            for node in all_nodes:
+                if node.node_type not in node_groups:
+                    node_groups[node.node_type] = []
+                node_groups[node.node_type].append(node)
+            
+            # 按类型添加到菜单
+            for node_type in sorted(node_groups.keys()):
+                type_menu = connect_menu.addMenu(node_type)
+                for node in node_groups[node_type]:
+                    action = type_menu.addAction(node.node_text)
+                    action.triggered.connect(lambda checked, n=node: self.connectToNode(n))
+        else:
+            connect_action = connect_menu.addAction("无可连接节点")
+            connect_action.setEnabled(False)
+        
         delete_action = menu.addAction("删除")
         delete_action.triggered.connect(self.deleteNode)
         
@@ -421,6 +454,28 @@ class FlowchartNode(QGraphicsItem):
             self.link = None
             self.update()
             self.scene().views()[0].main_window.setModified(True)
+    
+    def connectToNode(self, target_node):
+        """将当前节点连接到目标节点"""
+        # 检查是否已经有连接
+        for item in self.scene().items():
+            if isinstance(item, FlowchartConnection):
+                if (item.start_node == self and item.end_node == target_node) or \
+                   (item.start_node == target_node and item.end_node == self):
+                    # 已经有连接，显示提示并返回
+                    QMessageBox.information(None, "提示", "这两个节点已经有连接")
+                    return
+        
+        # 创建新连接
+        connection = FlowchartConnection(self, target_node)
+        self.scene().addItem(connection)
+        
+        # 添加到连接列表
+        self.connections.append(connection)
+        target_node.connections.append(connection)
+        
+        # 标记为已修改
+        self.scene().views()[0].main_window.setModified(True)
 
 class FlowchartConnection(QGraphicsPathItem):
     """思维导图连接线"""
@@ -1092,6 +1147,302 @@ class FlowchartEditor(QMainWindow):
         if hasattr(self, 'shortcut_manager'):
             self.shortcut_manager.toggle_fold_selected()
 
+    def saveFlowchart(self):
+        """保存思维导图"""
+        from flowchart.save_functions import save_flowchart
+        return save_flowchart(self)
+    
+    def saveFlowchartAs(self):
+        """思维导图另存为"""
+        from flowchart.save_functions import save_flowchart_as
+        return save_flowchart_as(self)
+    
+    def _convert_external_mindmap(self, file_path, file_ext):
+        """转换外部思维导图格式到我们的格式"""
+        try:
+            # 默认的返回结构
+            result = {"nodes": [], "connections": []}
+            
+            if file_ext == '.xmind':
+                # 处理XMind格式
+                import zipfile
+                import xml.etree.ElementTree as ET
+                
+                # XMind是一个zip文件，包含了XML文件
+                with zipfile.ZipFile(file_path) as xmind_zip:
+                    # 提取content.xml文件
+                    content = None
+                    for name in xmind_zip.namelist():
+                        if name.endswith('content.xml'):
+                            content = xmind_zip.read(name)
+                            break
+                    
+                    if content:
+                        root = ET.fromstring(content)
+                        # 解析XMind的XML结构
+                        # 这里是简化的处理，实际使用需要更详细的XMind格式分析
+                        node_id = 0
+                        # 处理第一个主题（通常XMind有一个根节点）
+                        for sheet in root.findall('.//sheet'):
+                            for topic in sheet.findall('.//topic'):
+                                # 创建中心主题
+                                node_id += 1
+                                title = topic.find('title').text if topic.find('title') is not None else "Center Topic"
+                                result["nodes"].append({
+                                    "id": str(node_id),
+                                    "type": "中心主题",
+                                    "text": title,
+                                    "pos_x": 0,
+                                    "pos_y": 0,
+                                    "color": "#3498db"
+                                })
+                                
+                                # 递归处理子主题
+                                center_id = str(node_id)
+                                self._process_xmind_children(topic, result, center_id, node_id)
+            
+            elif file_ext in ['.mindmap', '.mm']:
+                # 处理FreeMind/MindManager格式（通常是XML格式）
+                import xml.etree.ElementTree as ET
+                
+                tree = ET.parse(file_path)
+                root = tree.getroot()
+                
+                # 从根节点开始解析
+                node_id = 0
+                for node in root.findall('.//node'):
+                    # 获取节点文本
+                    text = node.get('TEXT') or node.get('text') or "Node"
+                    
+                    # 创建中心主题
+                    node_id += 1
+                    result["nodes"].append({
+                        "id": str(node_id),
+                        "type": "中心主题",
+                        "text": text,
+                        "pos_x": 0,
+                        "pos_y": 0,
+                        "color": "#3498db"
+                    })
+                    
+                    # 递归处理子节点
+                    center_id = str(node_id)
+                    self._process_mm_children(node, result, center_id, node_id)
+                    break  # 只处理第一个根节点
+            
+            return result
+            
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"无法转换思维导图文件: {str(e)}")
+            # 返回一个空的思维导图结构
+            return {"nodes": [], "connections": []}
+    
+    def _process_xmind_children(self, parent_topic, result, parent_id, current_id):
+        """递归处理XMind的子主题"""
+        x_offset = 200
+        y_offset = 100
+        child_count = 0
+        
+        # 查找所有子主题
+        for children in parent_topic.findall('./children/topics'):
+            for topic in children.findall('./topic'):
+                child_count += 1
+                title = topic.find('title').text if topic.find('title') is not None else f"Topic {child_count}"
+                
+                # 创建子节点
+                current_id += 1
+                child_id = str(current_id)
+                
+                # 计算位置（简化处理）
+                x = x_offset if child_count % 2 == 0 else -x_offset
+                y = y_offset * (child_count // 2 + 1)
+                
+                result["nodes"].append({
+                    "id": child_id,
+                    "type": "主要分支" if child_count <= 2 else "次要分支",
+                    "text": title,
+                    "pos_x": x,
+                    "pos_y": y,
+                    "color": "#e74c3c" if child_count % 2 == 0 else "#2ecc71"
+                })
+                
+                # 创建连接
+                result["connections"].append({
+                    "start": parent_id,
+                    "end": child_id,
+                    "color": "#7f8c8d",
+                    "width": 2
+                })
+                
+                # 递归处理子主题的子主题
+                self._process_xmind_children(topic, result, child_id, current_id)
+                current_id = int(child_id)  # 更新当前ID
+    
+    def _process_mm_children(self, parent_node, result, parent_id, current_id):
+        """递归处理FreeMind/MindManager的子节点"""
+        x_offset = 200
+        y_offset = 100
+        child_count = 0
+        
+        # 查找所有子节点
+        for child in parent_node.findall('./node'):
+            child_count += 1
+            text = child.get('TEXT') or child.get('text') or f"Node {child_count}"
+            
+            # 创建子节点
+            current_id += 1
+            child_id = str(current_id)
+            
+            # 计算位置（简化处理）
+            x = x_offset if child_count % 2 == 0 else -x_offset
+            y = y_offset * (child_count // 2 + 1)
+            
+            result["nodes"].append({
+                "id": child_id,
+                "type": "主要分支" if child_count <= 2 else "次要分支",
+                "text": text,
+                "pos_x": x,
+                "pos_y": y,
+                "color": "#e74c3c" if child_count % 2 == 0 else "#2ecc71"
+            })
+            
+            # 创建连接
+            result["connections"].append({
+                "start": parent_id,
+                "end": child_id,
+                "color": "#7f8c8d",
+                "width": 2
+            })
+            
+            # 递归处理子节点的子节点
+            self._process_mm_children(child, result, child_id, current_id)
+            current_id = int(child_id)  # 更新当前ID
+    
+    def _convert_general_json(self, data):
+        """尝试将一般的JSON转换为我们的思维导图格式"""
+        result = {"nodes": [], "connections": []}
+        
+        # 处理一般的JSON结构
+        try:
+            # 检查是否有常见的思维导图结构
+            if isinstance(data, dict):
+                # 如果是字典，找出可能的根节点
+                root_keys = ['root', 'rootTopic', 'main', 'centralTopic', 'centralNode']
+                root_key = None
+                for key in root_keys:
+                    if key in data:
+                        root_key = key
+                        break
+                
+                if root_key:
+                    # 创建中心主题
+                    root_data = data[root_key]
+                    root_text = root_data.get('text', root_data.get('title', root_data.get('name', "中心主题")))
+                    
+                    result["nodes"].append({
+                        "id": "1",
+                        "type": "中心主题",
+                        "text": root_text,
+                        "pos_x": 0,
+                        "pos_y": 0,
+                        "color": "#3498db"
+                    })
+                    
+                    # 处理子节点
+                    children_keys = ['children', 'topics', 'subtopics', 'branches']
+                    children_key = None
+                    for key in children_keys:
+                        if key in root_data:
+                            children_key = key
+                            break
+                    
+                    if children_key and isinstance(root_data[children_key], list):
+                        self._process_json_children(root_data[children_key], result, "1", 1)
+                else:
+                    # 尝试强行转换，把最上层的字典键作为节点
+                    result["nodes"].append({
+                        "id": "1",
+                        "type": "中心主题",
+                        "text": list(data.keys())[0] if data else "中心主题",
+                        "pos_x": 0,
+                        "pos_y": 0,
+                        "color": "#3498db"
+                    })
+            elif isinstance(data, list) and data:
+                # 如果是列表，把第一个元素作为中心主题
+                result["nodes"].append({
+                    "id": "1",
+                    "type": "中心主题",
+                    "text": str(data[0]),
+                    "pos_x": 0,
+                    "pos_y": 0,
+                    "color": "#3498db"
+                })
+                
+                # 将其余元素作为子节点
+                self._process_json_children(data[1:], result, "1", 1)
+                
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"无法解析JSON结构: {str(e)}")
+        
+        return result
+    
+    def _process_json_children(self, children, result, parent_id, current_id):
+        """递归处理JSON结构中的子节点"""
+        x_offset = 200
+        y_offset = 100
+        child_count = 0
+        
+        for child in children:
+            child_count += 1
+            current_id += 1
+            child_id = str(current_id)
+            
+            # 提取子节点文本
+            if isinstance(child, dict):
+                text_keys = ['text', 'title', 'name', 'label', 'content']
+                text = ""
+                for key in text_keys:
+                    if key in child:
+                        text = child[key]
+                        break
+                if not text:
+                    text = f"子节点 {child_count}"
+            else:
+                text = str(child)
+            
+            # 计算位置
+            x = x_offset if child_count % 2 == 0 else -x_offset
+            y = y_offset * (child_count // 2 + 1)
+            
+            # 添加节点
+            result["nodes"].append({
+                "id": child_id,
+                "type": "主要分支" if child_count <= 2 else "次要分支",
+                "text": text,
+                "pos_x": x,
+                "pos_y": y,
+                "color": "#e74c3c" if child_count % 2 == 0 else "#2ecc71"
+            })
+            
+            # 添加连接
+            result["connections"].append({
+                "start": parent_id,
+                "end": child_id,
+                "color": "#7f8c8d",
+                "width": 2
+            })
+            
+            # 处理子节点的子节点
+            if isinstance(child, dict):
+                children_keys = ['children', 'topics', 'subtopics', 'branches']
+                for key in children_keys:
+                    if key in child and isinstance(child[key], list):
+                        current_id = self._process_json_children(child[key], result, child_id, current_id)
+                        break
+            
+        return current_id
+
     def createToolBar(self):
         """创建工具栏"""
         toolbar = QToolBar(self)
@@ -1718,7 +2069,7 @@ class FlowchartEditor(QMainWindow):
         
         # 选择文件
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "打开思维导图", "", "思维导图文件 (*.mindmap);;All Files (*)"
+            self, "打开思维导图", "", "思维导图文件 (*.flow *.mindmap *.mm *.xmind);;JSON文件 (*.json);;All Files (*)"
         )
         
         if not file_path:
@@ -1728,9 +2079,28 @@ class FlowchartEditor(QMainWindow):
             # 清空当前场景
             self.scene.clear()
             
-            # 加载文件
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            # 根据文件扩展名选择不同的处理方式
+            file_ext = os.path.splitext(file_path)[1].lower()
+            
+            if file_ext == '.flow':
+                # 处理我们自己的格式
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            elif file_ext in ['.mindmap', '.mm', '.xmind']:
+                # 处理其他思维导图格式
+                data = self._convert_external_mindmap(file_path, file_ext)
+            elif file_ext == '.json':
+                # 处理JSON格式
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # 检查JSON是否有我们需要的结构
+                if "nodes" not in data or "connections" not in data:
+                    # 尝试转换为我们的格式
+                    data = self._convert_general_json(data)
+            else:
+                # 尝试常规方式加载
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
             
             # 设置当前文件路径
             self.current_file = file_path
@@ -1738,8 +2108,18 @@ class FlowchartEditor(QMainWindow):
             # 首先创建节点
             nodes = {}
             for node_data in data["nodes"]:
-                pos = QPointF(node_data["pos_x"], node_data["pos_y"])
-                node = FlowchartNode(node_data["type"], node_data["text"], pos)
+                # 兼容不同的坐标字段命名
+                x = node_data.get("pos_x", node_data.get("x", 0))
+                y = node_data.get("pos_y", node_data.get("y", 0))
+                pos = QPointF(x, y)
+                
+                # 兼容不同的文本字段命名
+                text = node_data.get("text", node_data.get("content", node_data.get("title", "")))
+                
+                # 兼容不同的类型字段命名
+                node_type = node_data.get("type", node_data.get("node_type", "主要分支"))
+                
+                node = FlowchartNode(node_type, text, pos)
                 if "color" in node_data:
                     node.color = QColor(node_data["color"])
                 self.scene.addItem(node)
@@ -1747,17 +2127,27 @@ class FlowchartEditor(QMainWindow):
             
             # 然后创建连接
             for conn_data in data["connections"]:
-                if conn_data["start_id"] in nodes and conn_data["end_id"] in nodes:
-                    start_node = nodes[conn_data["start_id"]]
-                    end_node = nodes[conn_data["end_id"]]
+                # 兼容不同的连接端点ID字段命名
+                start_id = conn_data.get("start_id", conn_data.get("start", conn_data.get("from", "")))
+                end_id = conn_data.get("end_id", conn_data.get("end", conn_data.get("to", "")))
+                
+                if start_id in nodes and end_id in nodes:
+                    start_node = nodes[start_id]
+                    end_node = nodes[end_id]
                     conn = FlowchartConnection(start_node, end_node)
-                    if "color" in conn_data:
-                        conn.color = QColor(conn_data["color"])
-                        pen = conn.pen()
-                        pen.setColor(conn.color)
-                        if "width" in conn_data:
-                            pen.setWidth(conn_data["width"])
-                        conn.setPen(pen)
+                    
+                    # 兼容不同的颜色字段命名
+                    color_value = conn_data.get("color", conn_data.get("line_color", conn_data.get("stroke", "#000000")))
+                    conn.color = QColor(color_value)
+                    
+                    pen = conn.pen()
+                    pen.setColor(conn.color)
+                    
+                    # 兼容不同的宽度字段命名
+                    width_value = conn_data.get("width", conn_data.get("line_width", conn_data.get("stroke_width", 2)))
+                    pen.setWidth(width_value)
+                    
+                    conn.setPen(pen)
                     self.scene.addItem(conn)
             
             # 重置历史记录
@@ -1941,8 +2331,7 @@ def openFlowchart(self):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法打开文件: {str(e)}")
             return False
-    
-    return False
+  
 
     def saveFlowchart(self):
         """保存思维导图"""
